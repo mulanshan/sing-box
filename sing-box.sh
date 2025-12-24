@@ -15,6 +15,9 @@ CONFIG_FILE="${CONFIG_DIR}/config.json"
 SERVICE_NAME="sing-box"
 CLIENT_CONFIG_FILE="${CONFIG_DIR}/client.txt"
 
+# 伪装域名 (Cloudflare)
+SNI_DOMAIN="www.cloudflare.com"
+
 # 检查 root 权限
 check_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -43,7 +46,6 @@ check_ss_command() {
     if ! command -v ss &> /dev/null; then
         echo -e "${YELLOW}ss 命令未找到，正在尝试自动安装 iproute2 ${RESET}"
         
-        # 检测包管理器并安装
         if command -v apt-get &> /dev/null; then
             sudo apt-get update && sudo apt-get install -y iproute2
         elif command -v yum &> /dev/null; then
@@ -59,7 +61,6 @@ check_ss_command() {
             exit 1
         fi
         
-        # 再次检查是否安装成功
         if command -v ss &> /dev/null; then
             echo -e "${GREEN}iproute2 安装成功，ss 命令已可用${RESET}"
         else
@@ -112,6 +113,7 @@ install_sing_box() {
     anytls_port=$(generate_unused_port)
     shadowtls_port=$(generate_unused_port)
     shadowsocks_port=$(generate_unused_port)
+    
     ss_password=$(sing-box generate rand 16 --base64)
     password=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)
 
@@ -121,13 +123,13 @@ install_sing_box() {
     private_key=$(echo "${reality_output}" | grep -oP 'PrivateKey:\s*\K.*')
     public_key=$(echo "${reality_output}" | grep -oP 'PublicKey:\s*\K.*')
 
-    # 生成自签名证书
+    # 生成自签名证书 (使用 Cloudflare 域名)
     mkdir -p "${CONFIG_DIR}"
     openssl ecparam -genkey -name prime256v1 -out "${CONFIG_DIR}/private.key" || {
         echo -e "${RED}生成私钥失败${RESET}"
         exit 1
     }
-    openssl req -new -x509 -days 3650 -key "${CONFIG_DIR}/private.key" -out "${CONFIG_DIR}/cert.pem" -subj "/CN=bing.com" || {
+    openssl req -new -x509 -days 3650 -key "${CONFIG_DIR}/private.key" -out "${CONFIG_DIR}/cert.pem" -subj "/CN=${SNI_DOMAIN}" || {
         echo -e "${RED}生成证书失败${RESET}"
         exit 1
     }
@@ -135,8 +137,6 @@ install_sing_box() {
     # 获取本机 IP 地址和所在国家
     host_ip=$(curl -s http://checkip.amazonaws.com)
     ip_country=$(curl -s http://ipinfo.io/${host_ip}/country)
-
-
 
     # 生成配置文件
     cat > "${CONFIG_FILE}" << EOF
@@ -157,7 +157,7 @@ install_sing_box() {
           "password": "${password}"
         }
       ],
-      "masquerade": "https://bing.com",
+      "masquerade": "https://${SNI_DOMAIN}",
       "tls": {
         "enabled": true,
         "alpn": [
@@ -180,16 +180,16 @@ install_sing_box() {
       ],
       "tls": {
         "enabled": true,
-        "server_name": "www.tesla.com",
+        "server_name": "${SNI_DOMAIN}",
         "reality": {
           "enabled": true,
           "handshake": {
-            "server": "www.tesla.com",
+            "server": "${SNI_DOMAIN}",
             "server_port": 443
           },
           "private_key": "${private_key}",
           "short_id": [
-            "123abc"
+            "123abc123abc"
           ]
         }
       }
@@ -223,7 +223,7 @@ install_sing_box() {
         }
       ],
       "handshake": {
-        "server": "www.bing.com",
+        "server": "${SNI_DOMAIN}",
         "server_port": 443
       },
       "strict_mode": true
@@ -269,19 +269,20 @@ EOF
 
     # 输出客户端配置到文件
     {
+        echo "=== Surge / Clash 格式片段 ==="
         cat << EOF
-  - name: ${ip_country}
+  - name: ${ip_country}_Hy2
     type: hysteria2
-    server: ${hysteria_port}
-    port: ${hport}
+    server: ${host_ip}
+    port: ${hysteria_port}
     password: ${password}
     alpn:
       - h3
-    sni: www.bing.com
+    sni: ${SNI_DOMAIN}
     skip-cert-verify: true
     fast-open: true
 
-  - name: ${ip_country}
+  - name: ${ip_country}_Reality
     type: vless
     server: ${host_ip}
     port: ${vless_port}
@@ -290,13 +291,13 @@ EOF
     udp: true
     tls: true
     flow: xtls-rprx-vision
-    servername: www.tesla.com
+    servername: ${SNI_DOMAIN}
     reality-opts:
       public-key: ${public_key}
-      short-id: 123abc
+      short-id: 123abc123abc
     client-fingerprint: chrome
 
-  - name: ${ip_country}
+  - name: ${ip_country}_SS_ShadowTLS
     type: ss
     server: ${host_ip}
     port: ${shadowtls_port}
@@ -307,7 +308,7 @@ EOF
     client-fingerprint: chrome
     plugin-opts:
       mode: tls
-      host: www.bing.com
+      host: ${SNI_DOMAIN}
       password: ${password}
       version: 3
     smux:
@@ -315,17 +316,16 @@ EOF
 EOF
 
         echo
-        echo "hy2://${password}@${host_ip}:${hysteria_port}?insecure=1&sni=www.bing.com#${ip_country}"
+        echo "=== 链接格式 (Shadowrocket / v2rayN) ==="
         echo
-        echo "${ip_country} = hysteria2, ${host_ip}, ${hysteria_port}, password = ${password}, skip-cert-verify=true, sni=www.bing.com"
+        echo "hy2://${password}@${host_ip}:${hysteria_port}?insecure=1&sni=${SNI_DOMAIN}#${ip_country}_Hy2"
         echo
-        echo "${ip_country} = anytls, ${host_ip}, ${anytls_port}, password = ${public_key}, skip-cert-verify=true, sni=www.bing.com"
+        echo "vless://${uuid}@${host_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI_DOMAIN}&fp=chrome&pbk=${public_key}&sid=123abc123abc&type=tcp&headerType=none#${ip_country}_Reality"
         echo
-        echo "anytls://${public_key}@${host_ip}:${anytls_port}?security=tls&sni=www.bing.com&allowInsecure=1&type=tcp#${ip_country}"
+        echo "ss://${ss_password}@${host_ip}:${shadowtls_port}?plugin=shadow-tls%3Bserver%3D${SNI_DOMAIN}%3Bversion%3D3%3Bpassword%3D${password}&encryption=2022-blake3-aes-128-gcm#${ip_country}_SS_STLS"
         echo
-        echo "${ip_country} = ss, ${host_ip}, ${shadowtls_port}, encrypt-method=2022-blake3-aes-128-gcm, password=${ss_password}, shadow-tls-password=${password}, shadow-tls-sni=www.bing.com, shadow-tls-version=3, udp-relay=true"
-        echo 
-        echo "vless://${uuid}@${host_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.tesla.com&fp=chrome&pbk=${public_key}&sid=123abc&type=tcp&headerType=none#${ip_country}"
+        echo "=== AnyTLS 链接 ==="
+        echo "anytls://${public_key}@${host_ip}:${anytls_port}?security=tls&sni=${SNI_DOMAIN}&allowInsecure=1&type=tcp#${ip_country}_AnyTLS"
         echo
     } > "${CLIENT_CONFIG_FILE}"
 
@@ -339,35 +339,12 @@ uninstall_sing_box() {
     case "${choice}" in
         y|Y)
             echo -e "${CYAN}正在卸载 sing-box${RESET}"
-
-            # 停止 sing-box 服务
-            systemctl stop "${SERVICE_NAME}" || {
-                echo -e "${RED}停止 sing-box 服务失败。${RESET}"
-            }
-
-            # 禁用 sing-box 服务
-            systemctl disable "${SERVICE_NAME}" || {
-                echo -e "${RED}禁用 sing-box 服务失败。${RESET}"
-            }
-
-            # 卸载 sing-box
-            dpkg --purge sing-box || {
-                echo -e "${YELLOW}无法通过 dpkg 卸载 sing-box，可能未通过 apt 安装。${RESET}"
-            }
-
-
-            # 重新加载 systemd
-            systemctl daemon-reload || {
-                echo -e "${YELLOW}无法重新加载 systemd 守护进程。${RESET}"
-            }
-
-            # 删除 sing-box 可执行文件，如果存在
-            if [ -f "/usr/local/bin/sing-box" ]; then
-                rm /usr/local/bin/sing-box || {
-                    echo -e "${YELLOW}无法删除 /usr/local/bin/sing-box。${RESET}"
-                }
-            fi
-
+            systemctl stop "${SERVICE_NAME}"
+            systemctl disable "${SERVICE_NAME}"
+            dpkg --purge sing-box || echo -e "${YELLOW}dpkg 卸载失败，尝试清理文件${RESET}"
+            systemctl daemon-reload
+            rm -f /usr/local/bin/sing-box
+            rm -rf "${CONFIG_DIR}"
             echo -e "${GREEN}sing-box 卸载成功${RESET}"
             ;;
         *)
@@ -379,31 +356,19 @@ uninstall_sing_box() {
 # 启动 sing-box
 start_sing_box() {
     systemctl start "${SERVICE_NAME}"
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}${SERVICE_NAME} 服务成功启动${RESET}"
-    else
-        echo -e "${RED}${SERVICE_NAME} 服务启动失败${RESET}"
-    fi
+    echo -e "${GREEN}${SERVICE_NAME} 服务启动操作已执行${RESET}"
 }
 
 # 停止 sing-box
 stop_sing_box() {
     systemctl stop "${SERVICE_NAME}"
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}${SERVICE_NAME} 服务成功停止${RESET}"
-    else
-        echo -e "${RED}${SERVICE_NAME} 服务停止失败${RESET}"
-    fi
+    echo -e "${GREEN}${SERVICE_NAME} 服务停止操作已执行${RESET}"
 }
 
 # 重启 sing-box
 restart_sing_box() {
     systemctl restart "${SERVICE_NAME}"
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}${SERVICE_NAME} 服务成功重启${RESET}"
-    else
-        echo -e "${RED}${SERVICE_NAME} 服务重启失败${RESET}"
-    fi
+    echo -e "${GREEN}${SERVICE_NAME} 服务重启操作已执行${RESET}"
 }
 
 # 查看 sing-box 状态
@@ -434,7 +399,7 @@ show_menu() {
     is_sing_box_running
     sing_box_running=$?
 
-    echo -e "${GREEN}=== sing-box 管理工具 ===${RESET}"
+    echo -e "${GREEN}=== sing-box 管理工具 (CF 专用版) ===${RESET}"
     echo -e "安装状态: $(if [ ${sing_box_installed} -eq 0 ]; then echo -e "${GREEN}已安装${RESET}"; else echo -e "${RED}未安装${RESET}"; fi)"
     echo -e "运行状态: $(if [ ${sing_box_running} -eq 0 ]; then echo -e "${GREEN}已运行${RESET}"; else echo -e "${RED}未运行${RESET}"; fi)"
     echo ""
@@ -449,7 +414,7 @@ show_menu() {
         echo "4. 重启 sing-box 服务"
         echo "5. 查看 sing-box 状态"
         echo "6. 查看 sing-box 日志"
-        echo "7. 查看 sing-box 配置"
+        echo "7. 查看 sing-box 配置 (获取链接)"
     fi
     echo "0. 退出"
     echo -e "${GREEN}=========================${RESET}"
